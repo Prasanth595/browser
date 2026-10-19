@@ -581,7 +581,8 @@ pub const Tool = enum {
                     \\  "properties": {
                     \\    "questions": { "type": "string", "description": "JSON string: array of categories, or object of questions (`{}` for every preset)" },
                     \\    "selector": { "type": "string", "description": "Optional CSS selector to classify a specific element subtree instead of the full page" },
-                    \\    "presets": { "type": "boolean", "description": "Also ask every preset in the same call, each answered under its own name beside the questions. Needs the object form." }
+                    \\    "presets": { "type": "boolean", "description": "Also ask every preset in the same call, each answered under its own name beside the questions. Needs the object form." },
+                    \\    "includeInput": { "type": "boolean", "description": "Also return what the questions were asked about: the result becomes `{answers, input}`, with `input` holding the `url`, `title`, `status` and semantic `tree` sent to the model, and the document's `html`." }
                     \\  },
                     \\  "required": ["questions"]
                     \\}
@@ -1990,6 +1991,7 @@ fn execClassify(arena: std.mem.Allocator, session: *lp.Session, registry: *NodeR
         questions: std.json.Value,
         selector: ?[]const u8 = null,
         presets: bool = false,
+        includeInput: bool = false,
     };
     const args = try parseArgs(Params, arena, arguments);
     const page = session.currentFrame() orelse return ToolError.FrameNotLoaded;
@@ -2003,10 +2005,8 @@ fn execClassify(arena: std.mem.Allocator, session: *lp.Session, registry: *NodeR
         else => return .{ .text = try std.fmt.allocPrint(arena, "classify: invalid questions: {s}", .{@errorName(err)}), .is_error = true },
     };
 
-    const state = lp.classify.buildState(arena, page, node, registry) catch |err| switch (err) {
-        error.OutOfMemory => return ToolError.OutOfMemory,
-        else => return ToolError.InternalError,
-    };
+    const read = lp.classify.readState(arena, page, node, registry) catch return ToolError.InternalError;
+    const state = lp.classify.buildState(arena, read) catch return ToolError.OutOfMemory;
 
     var detail: Failure = .{};
     var response = session.browser.app.askTypesafe(arena, state, prepared.questions, .{}, &detail) catch |err| switch (err) {
@@ -2020,8 +2020,13 @@ fn execClassify(arena: std.mem.Allocator, session: *lp.Session, registry: *NodeR
         error.OutOfMemory => return ToolError.OutOfMemory,
         else => return ToolError.InternalError,
     };
+    if (!args.includeInput) return .{ .text = formatted };
 
-    return .{ .text = formatted };
+    const input = lp.classify.localPage(arena, page, read) catch |err| switch (err) {
+        error.OutOfMemory => return ToolError.OutOfMemory,
+        else => return ToolError.InternalError,
+    };
+    return .{ .text = std.fmt.allocPrint(arena, "{{\"answers\":{s},\"input\":{f}}}", .{ formatted, std.json.fmt(input, .{}) }) catch return ToolError.OutOfMemory };
 }
 
 const eval_promise_timeout_ms: u32 = 30_000;

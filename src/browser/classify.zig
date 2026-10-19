@@ -229,26 +229,65 @@ pub fn addPresets(arena: std.mem.Allocator, prepared: PreparedQuestions) Prepare
     return .{ .questions = .init(entries.items), .kind = .questions_object };
 }
 
-/// Most of the page `buildState` sends, in bytes.
+/// Most of the page `buildState` sends, in bytes. The local model reads the
+/// same text, so its cap is the same.
 const max_state_bytes = 8192;
+comptime {
+    std.debug.assert(max_state_bytes == lp.classify_local.max_tree_bytes);
+}
+
+/// The page as `buildState` sends it, before it becomes JSON.
+pub const State = struct {
+    url: []const u8,
+    title: ?[]const u8,
+    status: ?u16,
+    tree: []const u8,
+};
 
 /// The page as Jev sees it: url, title, status, and the semantic tree of
 /// `node` as text. The tree keeps what markdown drops and the questions turn
 /// on (form fields, dialogs, the title of an iframe holding a CAPTCHA) and,
 /// without node ids, is about as long; links carry where they go.
-pub fn buildState(arena: std.mem.Allocator, page: *Frame, node: *DOMNode, registry: *NodeRegistry) !Content {
+pub fn readState(arena: std.mem.Allocator, page: *Frame, node: *DOMNode, registry: *NodeRegistry) !State {
     const tree = lp.SemanticTree.init(arena, node, registry, page, .{ .ids = false, .link_urls = true }) catch return error.InternalError;
     var aw: std.Io.Writer.Allocating = .init(arena);
     tree.textStringify(&aw.writer) catch return error.InternalError;
+    return .{
+        .url = page.url,
+        .title = page.getTitle() catch null,
+        .status = page._http_status,
+        .tree = truncateUtf8(aw.written(), max_state_bytes),
+    };
+}
 
+/// `read` as the JSON Jev is sent.
+pub fn buildState(arena: std.mem.Allocator, read: State) !Content {
     var state: std.json.ObjectMap = .empty;
-    try state.put(arena, "url", .{ .string = page.url });
-    try state.put(arena, "title", if (page.getTitle() catch null) |title| .{ .string = title } else .null);
-    if (page._http_status) |status| {
+    try state.put(arena, "url", .{ .string = read.url });
+    try state.put(arena, "title", if (read.title) |title| .{ .string = title } else .null);
+    if (read.status) |status| {
         try state.put(arena, "status", .{ .integer = status });
     }
-    try state.put(arena, "content", .{ .string = truncateUtf8(aw.written(), max_state_bytes) });
+    try state.put(arena, "content", .{ .string = read.tree });
     return .{ .json = .{ .object = state } };
+}
+
+/// What the local model reads of a page: `read`, what Jev is sent, plus the
+/// document's HTML as the html tool renders it. classify's `includeInput`
+/// returns this, which is how the model's training data is collected, so
+/// the model scores the same text it learned from.
+pub fn localPage(arena: std.mem.Allocator, page: *Frame, read: State) !lp.classify_local.Page {
+    const document = page.document.asNode();
+    const render = lp.RenderTree.resolve(arena, document, .{}, page) catch return error.OutOfMemory;
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    lp.dump.render(render, .{}, &aw.writer, page) catch return error.InternalError;
+    return .{
+        .url = read.url,
+        .title = read.title orelse "",
+        .status = read.status orelse 0,
+        .tree = read.tree,
+        .html = truncateUtf8(aw.written(), lp.classify_local.max_html_bytes),
+    };
 }
 
 /// At most `max` bytes of `text`, cut on a UTF-8 boundary.
