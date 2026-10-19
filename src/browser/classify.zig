@@ -290,6 +290,53 @@ pub fn localPage(arena: std.mem.Allocator, page: *Frame, read: State) !lp.classi
     };
 }
 
+/// The questions a local model answered, and the rest, for Jev.
+pub const Split = struct {
+    local: zenai.typesafe.types.Answers,
+    remaining: zenai.typesafe.Questions,
+};
+
+/// Splits `prepared` in two: the presets asked in their own words that
+/// `model` is sure of on `page`, answered with its calibrated scores, and
+/// everything else, custom questions included, for Jev.
+pub fn answerLocally(arena: std.mem.Allocator, model: *const lp.classify_local.Model, page: lp.classify_local.Page, prepared: PreparedQuestions) !Split {
+    const scores = try arena.alloc(f64, model.presets.len);
+    try model.score(arena, page, scores);
+    var local: std.ArrayList(zenai.typesafe.types.Answers.Entry) = .empty;
+    var remaining: std.ArrayList(zenai.typesafe.QuestionEntry) = .empty;
+    for (prepared.questions.entries) |entry| {
+        if (localScore(model, scores, entry)) |score| {
+            try local.append(arena, .{ .key = entry.key, .value = .{ .noul = .{ .noul = score } } });
+        } else {
+            try remaining.append(arena, entry);
+        }
+    }
+    return .{ .local = .init(local.items), .remaining = .init(remaining.items) };
+}
+
+/// The calibrated score of the preset `entry` asks, when it asks one in the
+/// preset's own words and the model is sure of the answer.
+fn localScore(model: *const lp.classify_local.Model, scores: []const f64, entry: zenai.typesafe.QuestionEntry) ?f64 {
+    const preset = Preset.fromString(entry.key) orelse return null;
+    const asked = switch (entry.value) {
+        .noul => |q| q.criteria == null and q.instructions == .text and std.mem.eql(u8, q.instructions.text, preset.description()),
+        else => false,
+    };
+    if (!asked) return null;
+    for (model.presets, scores) |local, score| {
+        if (Preset.fromString(local.name) != preset) continue;
+        const calibrated = local.calibrated(score);
+        const sure = lp.classify_local.sure;
+        return if (calibrated < sure or calibrated > 1 - sure) calibrated else null;
+    }
+    return null;
+}
+
+/// Jev's answers and the local ones, as one set.
+pub fn mergeAnswers(arena: std.mem.Allocator, jev: zenai.typesafe.types.Answers, local: zenai.typesafe.types.Answers) !zenai.typesafe.types.Answers {
+    return .init(try std.mem.concat(arena, zenai.typesafe.types.Answers.Entry, &.{ jev.entries, local.entries }));
+}
+
 /// At most `max` bytes of `text`, cut on a UTF-8 boundary.
 fn truncateUtf8(text: []const u8, max: usize) []const u8 {
     if (text.len <= max) return text;
@@ -575,4 +622,42 @@ test "browser.classify: formatResponse writes null for a missing answer" {
 
     const formatted = try formatResponse(arena.allocator(), response, prepared);
     try std.testing.expectEqualStrings("{\"isBlocked\":null,\"kind\":null}", formatted);
+}
+
+test "browser.classify: answerLocally answers the presets the model is sure of" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A model of two constant presets: is_blocked surely not, is_paywall
+    // anyone's guess.
+    var bytes: std.Io.Writer.Allocating = .init(a);
+    const w = &bytes.writer;
+    try w.writeAll("LPCM");
+    for ([_]u32{ 3, 20, 0, 2 }) |n| try w.writeInt(u32, n, .little);
+    for ([_]struct { []const u8, f32 }{ .{ "is_blocked", 0.01 }, .{ "is_paywall", 0.5 } }) |preset| {
+        try w.writeInt(u32, @intCast(preset[0].len), .little);
+        try w.writeAll(preset[0]);
+        try w.writeInt(u32, @bitCast(@as(f32, 0.5)), .little);
+        try w.writeByte(1);
+        try w.writeInt(u32, @bitCast(preset[1]), .little);
+    }
+    for (0..6) |_| try w.writeInt(u32, 0, .little); // matchers, literals, tags, words, chars, structure
+    const model = try lp.classify_local.Model.parse(std.testing.allocator, testing.test_app.regex_context, bytes.written());
+    defer model.deinit();
+
+    const prepared = try prepareQuestions(a, .{ .string = "{\"isBlocked\": true, \"isPaywall\": true, \"is_blocked\": \"Is it blocked?\", \"price\": \"Does it show a price?\"}" });
+    const page: lp.classify_local.Page = .{ .url = "https://example.com/", .title = "", .status = 200, .tree = "", .html = "" };
+    const split = try answerLocally(a, model, page, prepared);
+
+    try testing.expectEqual(1, split.local.count());
+    try testing.expectDelta(0.01, split.local.get("isBlocked").?.noul.noul, 1e-6);
+    // Unsure, asked in other words, or no preset: all left for Jev.
+    try testing.expect(split.remaining.has("isPaywall"));
+    try testing.expect(split.remaining.has("is_blocked"));
+    try testing.expect(split.remaining.has("price"));
+    try testing.expectEqual(3, split.remaining.count());
+
+    const merged = try mergeAnswers(a, .{}, split.local);
+    try testing.expectEqual(1, merged.count());
 }

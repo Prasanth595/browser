@@ -2008,25 +2008,44 @@ fn execClassify(arena: std.mem.Allocator, session: *lp.Session, registry: *NodeR
     const read = lp.classify.readState(arena, page, node, registry) catch return ToolError.InternalError;
     const state = lp.classify.buildState(arena, read) catch return ToolError.OutOfMemory;
 
+    // With --classify-model, the presets it is sure of are answered locally,
+    // and Jev gets the rest, if anything is left. It learned from whole
+    // pages, so a selector's subtree always goes to Jev.
+    var input: ?lp.classify_local.Page = null;
+    var local: ?lp.classify.Split = null;
+    if (session.browser.app.classify_model) |model| {
+        if (args.selector == null and prepared.kind == .questions_object) {
+            input = lp.classify.localPage(arena, page, read) catch |err| switch (err) {
+                error.OutOfMemory => return ToolError.OutOfMemory,
+                else => return ToolError.InternalError,
+            };
+            local = lp.classify.answerLocally(arena, model, input.?, prepared) catch return ToolError.OutOfMemory;
+        }
+    }
+    const for_jev = if (local) |l| l.remaining else prepared.questions;
+
     var detail: Failure = .{};
-    var response = session.browser.app.askTypesafe(arena, state, prepared.questions, .{}, &detail) catch |err| switch (err) {
+    var response = if (for_jev.count() == 0) null else session.browser.app.askTypesafe(arena, state, for_jev, .{}, &detail) catch |err| switch (err) {
         error.MissingApiKey => return .{ .text = "classify: " ++ zenai.typesafe.env_var_name ++ " environment variable is not set", .is_error = true },
         error.OutOfMemory => return ToolError.OutOfMemory,
         else => return apiFailed(arena, "classify", err, detail),
     };
-    defer response.deinit();
+    defer if (response) |*r| r.deinit();
 
-    const formatted = lp.classify.formatResponse(arena, response.value, prepared) catch |err| switch (err) {
+    var answered: zenai.typesafe.types.AskResponse = if (response) |r| r.value else .{};
+    if (local) |l| answered.answers = lp.classify.mergeAnswers(arena, answered.answers, l.local) catch return ToolError.OutOfMemory;
+
+    const formatted = lp.classify.formatResponse(arena, answered, prepared) catch |err| switch (err) {
         error.OutOfMemory => return ToolError.OutOfMemory,
         else => return ToolError.InternalError,
     };
     if (!args.includeInput) return .{ .text = formatted };
 
-    const input = lp.classify.localPage(arena, page, read) catch |err| switch (err) {
+    if (input == null) input = lp.classify.localPage(arena, page, read) catch |err| switch (err) {
         error.OutOfMemory => return ToolError.OutOfMemory,
         else => return ToolError.InternalError,
     };
-    return .{ .text = std.fmt.allocPrint(arena, "{{\"answers\":{s},\"input\":{f}}}", .{ formatted, std.json.fmt(input, .{}) }) catch return ToolError.OutOfMemory };
+    return .{ .text = std.fmt.allocPrint(arena, "{{\"answers\":{s},\"input\":{f}}}", .{ formatted, std.json.fmt(input.?, .{}) }) catch return ToolError.OutOfMemory };
 }
 
 const eval_promise_timeout_ms: u32 = 30_000;
