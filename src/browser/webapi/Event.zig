@@ -108,6 +108,8 @@ pub const Type = union(enum) {
     task_priority_change_event: *@import("event/TaskPriorityChangeEvent.zig"),
     offline_audio_completion_event: *@import("webaudio/OfflineAudioCompletionEvent.zig"),
     payment_request_update_event: *@import("payment/PaymentRequestUpdateEvent.zig"),
+    tool_activated_event: *@import("event/ToolEvent.zig").ToolActivatedEvent,
+    tool_cancel_event: *@import("event/ToolEvent.zig").ToolCancelEvent,
 };
 
 pub const Options = struct {
@@ -259,6 +261,8 @@ pub fn is(self: *Event, comptime T: type) ?*T {
         .toggle_event => |e| return if (T == @import("event/ToggleEvent.zig")) e else null,
         .task_priority_change_event => |e| return if (T == @import("event/TaskPriorityChangeEvent.zig")) e else null,
         .offline_audio_completion_event => |e| return if (T == @import("webaudio/OfflineAudioCompletionEvent.zig")) e else null,
+        .tool_activated_event => |e| return if (T == @import("event/ToolEvent.zig").ToolActivatedEvent) e else null,
+        .tool_cancel_event => |e| return if (T == @import("event/ToolEvent.zig").ToolCancelEvent) e else null,
         .ui_event => |e| {
             if (T == @import("event/UIEvent.zig")) {
                 return e;
