@@ -97,6 +97,8 @@ profile() {
     # This subshell's own trap: the script's cleanup doesn't know this pid.
     trap "kill $pid 2> /dev/null || true" EXIT
     sleep 1
+    # Otherwise the bench silently runs against whatever holds the port.
+    kill -0 "$pid" 2> /dev/null || { echo "lightpanda serve exited at startup; is :9222 already in use?" >&2; exit 1; }
     (cd "$DEMO_DIR" && RUNS=$RUNS node puppeteer/cdp.js > "$OUT/bench.out")
     # A bench that dies early still leaves a resident set, just the wrong one.
     grep -q '^total runs' "$OUT/bench.out" || { echo "bench did not complete, see $OUT/bench.out" >&2; exit 1; }
